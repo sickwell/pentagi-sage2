@@ -263,7 +263,8 @@ func TestSignRequest_ProducesValidSignature(t *testing.T) {
 	body := []byte(`{"content":"test"}`)
 	timestamp := time.Now().Unix()
 
-	sig := client.signRequest(method, path, body, timestamp)
+	nonce := []byte("12345678")
+	sig := client.signRequest(method, path, body, timestamp, nonce)
 
 	// Ed25519 signatures are always 64 bytes.
 	if len(sig) != ed25519.SignatureSize {
@@ -278,9 +279,10 @@ func TestSignRequest_ProducesValidSignature(t *testing.T) {
 	tsBytes := make([]byte, 8)
 	binary.BigEndian.PutUint64(tsBytes, uint64(timestamp))
 
-	message := make([]byte, 0, len(bodyHash)+8)
+	message := make([]byte, 0, len(bodyHash)+8+len(nonce))
 	message = append(message, bodyHash[:]...)
 	message = append(message, tsBytes...)
+	message = append(message, nonce...)
 
 	if !ed25519.Verify(client.publicKey, message, sig) {
 		t.Fatal("signature verification failed")
@@ -295,8 +297,9 @@ func TestSignRequest_DifferentPathsDifferentSignatures(t *testing.T) {
 	body := []byte(`{"query":"test"}`)
 	ts := time.Now().Unix()
 
-	sig1 := client.signRequest("POST", "/v1/memory/search", body, ts)
-	sig2 := client.signRequest("POST", "/v1/memory/submit", body, ts)
+	nonce := []byte("12345678")
+	sig1 := client.signRequest("POST", "/v1/memory/search", body, ts, nonce)
+	sig2 := client.signRequest("POST", "/v1/memory/submit", body, ts, nonce)
 
 	if bytes.Equal(sig1, sig2) {
 		t.Fatal("signatures for different paths must differ (prevents cross-endpoint replay)")
@@ -311,8 +314,9 @@ func TestSignRequest_DifferentTimestampsDifferentSignatures(t *testing.T) {
 	body := []byte(`{"content":"test"}`)
 	path := "/v1/memory/submit"
 
-	sig1 := client.signRequest("POST", path, body, 1000)
-	sig2 := client.signRequest("POST", path, body, 2000)
+	nonce := []byte("12345678")
+	sig1 := client.signRequest("POST", path, body, 1000, nonce)
+	sig2 := client.signRequest("POST", path, body, 2000, nonce)
 
 	if bytes.Equal(sig1, sig2) {
 		t.Fatal("signatures for different timestamps must differ")

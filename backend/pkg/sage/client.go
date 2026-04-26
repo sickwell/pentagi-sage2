@@ -300,8 +300,8 @@ func (c *Client) RecallSemantic(ctx context.Context, req RecallRequest) (*Recall
 // --- Ed25519 request signing --------------------------------------------------
 
 // signRequest produces the Ed25519 signature for a SAGE API request.
-// Signed message format: SHA-256(method + " " + path + "\n" + body) || BigEndian(timestamp)
-func (c *Client) signRequest(method, path string, body []byte, timestamp int64) []byte {
+// Signed message format: SHA-256(method + " " + path + "\n" + body) || BigEndian(timestamp) || nonce.
+func (c *Client) signRequest(method, path string, body []byte, timestamp int64, nonce []byte) []byte {
 	canonical := []byte(method + " " + path + "\n")
 	canonical = append(canonical, body...)
 	bodyHash := sha256.Sum256(canonical)
@@ -309,9 +309,10 @@ func (c *Client) signRequest(method, path string, body []byte, timestamp int64) 
 	tsBytes := make([]byte, 8)
 	binary.BigEndian.PutUint64(tsBytes, uint64(timestamp))
 
-	message := make([]byte, 0, len(bodyHash)+8)
+	message := make([]byte, 0, len(bodyHash)+8+len(nonce))
 	message = append(message, bodyHash[:]...)
 	message = append(message, tsBytes...)
+	message = append(message, nonce...)
 
 	return ed25519.Sign(c.privateKey, message)
 }
@@ -337,10 +338,15 @@ func (c *Client) doJSON(ctx context.Context, method, path string, reqBody, respB
 
 	// SAGE Ed25519 authentication headers
 	timestamp := time.Now().Unix()
-	sig := c.signRequest(method, path, bodyBytes, timestamp)
+	nonce := make([]byte, 8)
+	if _, err := rand.Read(nonce); err != nil {
+		return fmt.Errorf("failed to generate nonce: %w", err)
+	}
+	sig := c.signRequest(method, path, bodyBytes, timestamp, nonce)
 	req.Header.Set("X-Agent-ID", c.agentID)
 	req.Header.Set("X-Signature", hex.EncodeToString(sig))
 	req.Header.Set("X-Timestamp", strconv.FormatInt(timestamp, 10))
+	req.Header.Set("X-Nonce", hex.EncodeToString(nonce))
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
