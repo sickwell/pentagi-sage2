@@ -12,6 +12,7 @@ import (
 	"pentagi/pkg/database"
 	obs "pentagi/pkg/observability"
 	"pentagi/pkg/providers/pconfig"
+	"pentagi/pkg/sage"
 	"pentagi/pkg/templates"
 	"pentagi/pkg/tools"
 
@@ -652,6 +653,11 @@ func (fp *flowProvider) performPentester(
 		return "", fmt.Errorf("failed to get pentester executor: %w", err)
 	}
 
+	// Inject recall
+	if sageContext := fp.buildSAGERecallContext(ctx, question, taskID, subtaskID, ""); sageContext != "" {
+		systemPentesterTmpl = sageContext + "\n\n" + systemPentesterTmpl
+	}
+
 	if fp.planning {
 		userPentesterTmplWithPlan, err := fp.performPlanner(
 			ctx, taskID, subtaskID, optAgentType, executor, userPentesterTmpl, question,
@@ -675,6 +681,10 @@ func (fp *flowProvider) performPentester(
 		return "", fmt.Errorf("failed to get task pentester result: %w", err)
 	}
 
+	if hackResult.Result != "" {
+		fp.autoRememberPentesterResult(ctx, question, hackResult.Result, taskID, subtaskID)
+	}
+
 	if agentCtx, ok := tools.GetAgentContext(ctx); ok {
 		fp.putAgentLog(
 			ctx,
@@ -688,6 +698,36 @@ func (fp *flowProvider) performPentester(
 	}
 
 	return hackResult.Result, nil
+}
+
+func (fp *flowProvider) buildSAGERecallContext(ctx context.Context, query string, taskID, subtaskID *int64, domain string) string {
+	if fp.sageClient == nil || !fp.sageClient.IsEnabled() {
+		return ""
+	}
+	resp, err := fp.sageClient.RecallSemantic(ctx, sage.RecallRequest{Query: strings.TrimSpace(query), Domain: domain, MaxResults: 5, MinConfidence: 0.5})
+	if err != nil {
+		return ""
+	}
+	if resp == nil || len(resp.Memories) == 0 {
+		return ""
+	}
+	return "## SAGE HISTORICAL CONTEXT\n" + tools.FormatSageRecallResults(resp, query)
+}
+
+func (fp *flowProvider) autoRememberPentesterResult(ctx context.Context, question, result string, taskID, subtaskID *int64) {
+	if fp.sageClient == nil || !fp.sageClient.IsEnabled() || strings.TrimSpace(result) == "" {
+		return
+	}
+	content := fmt.Sprintf("Task: %s\n\nFindings: %s", strings.TrimSpace(question), strings.TrimSpace(result))
+	_, err := fp.sageClient.Remember(ctx, sage.RememberRequest{
+		Content:    content,
+		MemoryType: "observation",
+		Domain:     "pentagi-recon",
+		Confidence: 0.8,
+	})
+	if err == nil {
+		logrus.WithContext(ctx).Info("stored pentester result in SAGE")
+	}
 }
 
 func (fp *flowProvider) performSearcher(
