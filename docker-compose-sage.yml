@@ -7,7 +7,6 @@ volumes:
 networks:
   pentagi-network:
     driver: bridge
-    external: true
     name: pentagi-network
 
 services:
