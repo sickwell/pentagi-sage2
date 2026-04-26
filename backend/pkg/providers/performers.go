@@ -12,7 +12,6 @@ import (
 	"pentagi/pkg/database"
 	obs "pentagi/pkg/observability"
 	"pentagi/pkg/providers/pconfig"
-	"pentagi/pkg/sage"
 	"pentagi/pkg/templates"
 	"pentagi/pkg/tools"
 
@@ -567,6 +566,10 @@ func (fp *flowProvider) performMemorist(
 		return "", fmt.Errorf("failed to get memorist executor: %w", err)
 	}
 
+	if sageContext := fp.executeSAGERecall(ctx, executor, question); sageContext != "" {
+		systemMemoristTmpl = "## SAGE HISTORICAL CONTEXT\n" + sageContext + "\n\n" + systemMemoristTmpl
+	}
+
 	msgChainID, chain, err := fp.restoreChain(
 		ctx, taskID, subtaskID, optAgentType, msgChainType, systemMemoristTmpl, userMemoristTmpl,
 	)
@@ -653,8 +656,7 @@ func (fp *flowProvider) performPentester(
 		return "", fmt.Errorf("failed to get pentester executor: %w", err)
 	}
 
-	// Inject recall
-	if sageContext := fp.buildSAGERecallContext(ctx, question, taskID, subtaskID, ""); sageContext != "" {
+	if sageContext := fp.executeSAGERecall(ctx, executor, question); sageContext != "" {
 		systemPentesterTmpl = sageContext + "\n\n" + systemPentesterTmpl
 	}
 
@@ -682,7 +684,7 @@ func (fp *flowProvider) performPentester(
 	}
 
 	if hackResult.Result != "" {
-		fp.autoRememberPentesterResult(ctx, question, hackResult.Result, taskID, subtaskID)
+		fp.executeSAGERemember(ctx, executor, question, hackResult.Result)
 	}
 
 	if agentCtx, ok := tools.GetAgentContext(ctx); ok {
@@ -700,34 +702,100 @@ func (fp *flowProvider) performPentester(
 	return hackResult.Result, nil
 }
 
-func (fp *flowProvider) buildSAGERecallContext(ctx context.Context, query string, taskID, subtaskID *int64, domain string) string {
-	if fp.sageClient == nil || !fp.sageClient.IsEnabled() {
+func (fp *flowProvider) executeSAGERecall(ctx context.Context, executor tools.ContextToolsExecutor, query string) string {
+	if executor == nil || !executor.IsFunctionExists(tools.SageRecallToolName) {
 		return ""
 	}
-	resp, err := fp.sageClient.RecallSemantic(ctx, sage.RecallRequest{Query: strings.TrimSpace(query), Domain: domain, MaxResults: 5, MinConfidence: 0.5})
+
+	args, err := json.Marshal(tools.SageRecallAction{
+		Query:         strings.TrimSpace(query),
+		MinConfidence: 0.5,
+		MaxResults:    func() *tools.Int64 { v := tools.Int64(5); return &v }(),
+		Message:       "Checking cross-session SAGE memory for relevant prior findings",
+	})
 	if err != nil {
 		return ""
 	}
-	if resp == nil || len(resp.Memories) == 0 {
+
+	toolCallID := templates.GenerateFromPattern(fp.tcIDTemplate, tools.SageRecallToolName)
+	result, err := executor.Execute(ctx, 0, toolCallID, tools.SageRecallToolName, tools.SageRecallToolName, "", args)
+	if err != nil {
+		logrus.WithContext(ctx).WithField("sage_recall_query", query).WithError(err).Warn("failed to execute forced sage_recall")
 		return ""
 	}
-	return "## SAGE HISTORICAL CONTEXT\n" + tools.FormatSageRecallResults(resp, query)
+
+	if strings.TrimSpace(result) == "" {
+		return ""
+	}
+
+	logrus.WithContext(ctx).WithField("sage_recall_query", query).Info("SAGE recall context loaded")
+	return result
 }
 
-func (fp *flowProvider) autoRememberPentesterResult(ctx context.Context, question, result string, taskID, subtaskID *int64) {
-	if fp.sageClient == nil || !fp.sageClient.IsEnabled() || strings.TrimSpace(result) == "" {
+	// Helper to classify memory type based on result content
+func classifySAGEMemoryType(text string) string {
+	switch {
+	case strings.Contains(text, "confirmed") || strings.Contains(text, "vulnerable") || strings.Contains(text, "successful") || strings.Contains(text, "credential"):
+		return "fact"
+	case strings.Contains(text, "likely") || strings.Contains(text, "may") || strings.Contains(text, "possible") || strings.Contains(text, "appears"):
+		return "inference"
+	default:
+		return "observation"
+	}
+}
+
+// Helper to classify memory domain based on context
+func classifySAGEDomain(text string) string {
+	text = strings.ToLower(text)
+	switch {
+	case strings.Contains(text, "cve-") || strings.Contains(text, "exploit") || strings.Contains(text, "rce") || strings.Contains(text, "privesc"):
+		return "pentagi-exploit"
+	case strings.Contains(text, "nmap") || strings.Contains(text, "gobuster") || strings.Contains(text, "port") || strings.Contains(text, "service") || strings.Contains(text, "vhost"):
+		return "pentagi-recon"
+	default:
+		return "pentagi-general"
+	}
+}
+
+func (fp *flowProvider) executeSAGERemember(ctx context.Context, executor tools.ContextToolsExecutor, question, result string) {
+	if executor == nil || !executor.IsFunctionExists(tools.SageRememberToolName) || strings.TrimSpace(result) == "" {
 		return
 	}
+
 	content := fmt.Sprintf("Task: %s\n\nFindings: %s", strings.TrimSpace(question), strings.TrimSpace(result))
-	_, err := fp.sageClient.Remember(ctx, sage.RememberRequest{
-		Content:    content,
-		MemoryType: "observation",
-		Domain:     "pentagi-recon",
-		Confidence: 0.8,
-	})
-	if err == nil {
-		logrus.WithContext(ctx).Info("stored pentester result in SAGE")
+	if len(content) > 4000 {
+		content = content[:4000]
 	}
+
+	memoryType := classifySAGEMemoryType(result)
+	domain := classifySAGEDomain(question + "\n" + result)
+
+	args, err := json.Marshal(tools.SageRememberAction{
+		Content:    content,
+		MemoryType: memoryType,
+		Domain:     domain,
+		Confidence: 0.8,
+		Message:    "Storing useful pentest result in SAGE memory",
+	})
+	if err != nil {
+		return
+	}
+
+	toolCallID := templates.GenerateFromPattern(fp.tcIDTemplate, tools.SageRememberToolName)
+	resp, err := executor.Execute(ctx, 0, toolCallID, tools.SageRememberToolName, tools.SageRememberToolName, "", args)
+	if err != nil {
+		logrus.WithContext(ctx).WithFields(logrus.Fields{
+			"sage_domain":      domain,
+			"sage_memory_type": memoryType,
+		}).WithError(err).Warn("failed to execute forced sage_remember")
+		return
+	}
+
+	logrus.WithContext(ctx).WithFields(logrus.Fields{
+		"sage_domain":      domain,
+		"sage_memory_type": memoryType,
+		"sage_result":      resp,
+	}).Info("stored pentester result in SAGE")
 }
 
 func (fp *flowProvider) performSearcher(

@@ -268,8 +268,7 @@ func (ce *customExecutor) Execute(
 	case BarrierToolType:
 		obsWrapper = ce.createSpanObservation(ctx, obsName, args)
 	case SearchVectorDbToolType:
-		// Skip - handlers create RETRIEVER internally
-		obsWrapper = &noopObservationWrapper{context: ctx}
+		obsWrapper = ce.createToolObservation(ctx, obsName, args)
 	default:
 		// Unknown type - use no-op wrapper
 		obsWrapper = &noopObservationWrapper{context: ctx}
