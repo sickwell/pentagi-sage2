@@ -99,7 +99,46 @@ func NewClient(endpoint, keyPath, agentName string, timeout time.Duration, enabl
 		return nil, fmt.Errorf("sage health check failed: %w", err)
 	}
 
+	if err := client.Register(context.Background()); err != nil {
+		return nil, fmt.Errorf("sage register failed: %w", err)
+	}
+
 	return client, nil
+}
+
+// Register idempotently registers or refreshes this agent in SAGE.
+func (c *Client) Register(ctx context.Context) error {
+	if !c.IsEnabled() {
+		return fmt.Errorf("sage is not enabled")
+	}
+
+	req := registerAgentRequest{
+		Name:     c.agentName,
+		Role:     "member",
+		BootBio:  "PentAGI backend agent",
+		Provider: c.agentName,
+	}
+
+	var resp registerAgentResponse
+	if err := c.doJSON(ctx, http.MethodPost, "/v1/agent/register", req, &resp); err != nil {
+		return fmt.Errorf("agent register request failed: %w", err)
+	}
+
+	return nil
+}
+
+type registerAgentRequest struct {
+	Name     string `json:"name"`
+	Role     string `json:"role"`
+	BootBio  string `json:"boot_bio,omitempty"`
+	Provider string `json:"provider,omitempty"`
+}
+
+type registerAgentResponse struct {
+	AgentID string `json:"agent_id"`
+	Name    string `json:"name"`
+	Role    string `json:"role"`
+	Status  string `json:"status"`
 }
 
 // IsEnabled returns whether SAGE integration is active.
